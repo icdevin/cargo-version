@@ -73,8 +73,6 @@ enum Bump {
 #[derive(Debug, Eq, PartialEq)]
 struct ManifestUpdate {
     content: String,
-    package_name: String,
-    old_version: Version,
     new_version: Version,
 }
 
@@ -92,7 +90,6 @@ fn run() -> Result<(), String> {
     let manifest = fs::read_to_string(manifest_path)
         .map_err(|error| format!("failed to read {MANIFEST}: {error}"))?;
     let update = update_manifest_version(&manifest, &cli.request, cli.preid.as_deref())?;
-    let lockfile_update = lockfile_update_if_present(&update)?;
     let git = GitState::discover()?;
     let should_commit_and_tag = git.in_worktree && !cli.no_git_tag_version;
 
@@ -103,14 +100,11 @@ fn run() -> Result<(), String> {
     fs::write(manifest_path, update.content)
         .map_err(|error| format!("failed to write {MANIFEST}: {error}"))?;
 
-    if let Some((path, content)) = &lockfile_update {
-        fs::write(path, content)
-            .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
-    }
+    let lockfile_update = refresh_lockfile_if_present()?;
 
     if should_commit_and_tag {
         let mut paths = vec![PathBuf::from(MANIFEST)];
-        if let Some((path, _)) = &lockfile_update {
+        if let Some(path) = &lockfile_update {
             paths.push(path.clone());
         }
         commit_and_tag(&paths, &update.new_version, &cli.message, cli.sign_git_tag)?;
@@ -148,13 +142,14 @@ fn update_manifest_version(
         .as_table_mut()
         .ok_or_else(|| String::from("could not find [package] in Cargo.toml"))?;
 
-    let package_name = package["name"]
-        .as_str()
-        .ok_or_else(|| String::from("could not find package.name in Cargo.toml"))?
-        .to_string();
+    package
+        .get("name")
+        .and_then(|item| item.as_str())
+        .ok_or_else(|| String::from("could not find package.name in Cargo.toml"))?;
 
-    let old_version = package["version"]
-        .as_str()
+    let old_version = package
+        .get("version")
+        .and_then(|item| item.as_str())
         .ok_or_else(|| String::from("could not find package.version in Cargo.toml"))?;
     let old_version = Version::parse(old_version)
         .map_err(|error| format!("unsupported package.version '{old_version}': {error}"))?;
@@ -168,8 +163,6 @@ fn update_manifest_version(
 
     Ok(ManifestUpdate {
         content: doc.to_string(),
-        package_name,
-        old_version,
         new_version,
     })
 }
@@ -279,40 +272,40 @@ fn increment_prerelease(current: &Prerelease, preid: Option<&str>) -> Result<Pre
         }
     }
 
-    if let Some(last) = parts.last_mut() {
-        if let Ok(value) = last.parse::<u64>() {
-            let incremented = value + 1;
-            let mut updated = parts[..parts.len() - 1].join(".");
-            if !updated.is_empty() {
-                updated.push('.');
-            }
-            updated.push_str(&incremented.to_string());
-            return Prerelease::new(&updated)
-                .map_err(|error| format!("invalid prerelease '{updated}': {error}"));
+    if let Some(last) = parts.last_mut()
+        && let Ok(value) = last.parse::<u64>()
+    {
+        let incremented = value + 1;
+        let mut updated = parts[..parts.len() - 1].join(".");
+        if !updated.is_empty() {
+            updated.push('.');
         }
+        updated.push_str(&incremented.to_string());
+        return Prerelease::new(&updated)
+            .map_err(|error| format!("invalid prerelease '{updated}': {error}"));
     }
 
     let updated = format!("{current}.0");
     Prerelease::new(&updated).map_err(|error| format!("invalid prerelease '{updated}': {error}"))
 }
 
-fn lockfile_update_if_present(
-    update: &ManifestUpdate,
-) -> Result<Option<(PathBuf, String)>, String> {
+fn refresh_lockfile_if_present() -> Result<Option<PathBuf>, String> {
     let Some(path) = lockfile_path()? else {
         return Ok(None);
     };
 
-    let lockfile = fs::read_to_string(&path)
-        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-    let content = update_lockfile_package(
-        &lockfile,
-        &update.package_name,
-        &update.old_version,
-        &update.new_version,
+    command_status(
+        &mut cargo_update_workspace_command(),
+        "cargo update --workspace",
     )?;
 
-    Ok(Some((path, content)))
+    Ok(Some(path))
+}
+
+fn cargo_update_workspace_command() -> Command {
+    let mut command = Command::new("cargo");
+    command.args(["update", "--workspace", "--manifest-path", MANIFEST]);
+    command
 }
 
 fn lockfile_path() -> Result<Option<PathBuf>, String> {
@@ -346,41 +339,6 @@ fn lockfile_path() -> Result<Option<PathBuf>, String> {
     let lockfile = workspace_root.join(LOCKFILE);
 
     Ok(lockfile.exists().then_some(lockfile))
-}
-
-fn update_lockfile_package(
-    lockfile: &str,
-    package_name: &str,
-    old_version: &Version,
-    new_version: &Version,
-) -> Result<String, String> {
-    let mut doc = lockfile
-        .parse::<DocumentMut>()
-        .map_err(|error| format!("failed to parse {LOCKFILE}: {error}"))?;
-    let packages = doc["package"]
-        .as_array_of_tables_mut()
-        .ok_or_else(|| String::from("could not find [[package]] entries in Cargo.lock"))?;
-
-    let old_version = old_version.to_string();
-    let mut updated = false;
-
-    for package in packages.iter_mut() {
-        let name_matches = package["name"].as_str() == Some(package_name);
-        let version_matches = package["version"].as_str() == Some(old_version.as_str());
-
-        if name_matches && version_matches {
-            package["version"] = value(new_version.to_string());
-            updated = true;
-        }
-    }
-
-    if !updated {
-        return Err(format!(
-            "could not find {package_name} {old_version} in {LOCKFILE}"
-        ));
-    }
-
-    Ok(doc.to_string())
 }
 
 #[derive(Debug)]
@@ -433,19 +391,19 @@ fn commit_and_tag(
     let message = message_template.replace("%s", &version.to_string());
     let mut add_args = vec![OsStr::new("add")];
     add_args.extend(paths.iter().map(|path| path.as_os_str()));
-    git_status(Command::new("git").args(add_args), "git add")?;
-    git_status(
+    command_status(Command::new("git").args(add_args), "git add")?;
+    command_status(
         Command::new("git").args(["commit", "-m", message.as_str()]),
         "git commit",
     )?;
 
     if sign_git_tag {
-        git_status(
+        command_status(
             Command::new("git").args(["tag", "-s", tag.as_str(), "-m", tag.as_str()]),
             "git tag",
         )?;
     } else {
-        git_status(
+        command_status(
             Command::new("git").args(["tag", "--no-sign", tag.as_str()]),
             "git tag",
         )?;
@@ -467,7 +425,7 @@ fn git_output<const N: usize>(args: [&str; N]) -> Result<String, String> {
     String::from_utf8(output.stdout).map_err(|_| String::from("git returned invalid UTF-8"))
 }
 
-fn git_status(command: &mut Command, label: &str) -> Result<(), String> {
+fn command_status(command: &mut Command, label: &str) -> Result<(), String> {
     let output = command
         .output()
         .map_err(|error| format!("failed to run {label}: {error}"))?;
@@ -507,8 +465,6 @@ mod tests {
         let update =
             update_manifest_version(manifest, &VersionRequest::Bump(Bump::Patch), None).unwrap();
 
-        assert_eq!(update.package_name, "demo");
-        assert_eq!(update.old_version.to_string(), "1.2.3");
         assert_eq!(update.new_version.to_string(), "1.2.4");
         assert!(update.content.contains("version = \"1.2.4\""));
     }
@@ -607,34 +563,25 @@ mod tests {
     }
 
     #[test]
-    fn updates_matching_cargo_lock_package() {
-        let lockfile = "# This file is automatically @generated by Cargo.\nversion = 4\n\n[[package]]\nname = \"demo\"\nversion = \"1.2.3\"\n\n[[package]]\nname = \"other\"\nversion = \"1.2.3\"\n";
+    fn rejects_manifest_without_package_name() {
+        let manifest = "[package]\nversion = \"1.2.3\"\n";
 
-        let updated = update_lockfile_package(
-            lockfile,
-            "demo",
-            &Version::parse("1.2.3").unwrap(),
-            &Version::parse("1.2.4").unwrap(),
-        )
-        .unwrap();
+        let error = update_manifest_version(manifest, &VersionRequest::Bump(Bump::Patch), None)
+            .unwrap_err();
 
-        assert!(updated.contains("name = \"demo\"\nversion = \"1.2.4\""));
-        assert!(updated.contains("name = \"other\"\nversion = \"1.2.3\""));
+        assert!(error.contains("package.name"));
     }
 
     #[test]
-    fn rejects_lockfile_without_matching_package() {
-        let lockfile = "[[package]]\nname = \"other\"\nversion = \"1.2.3\"\n";
+    fn cargo_update_command_targets_workspace_manifest() {
+        let command = cargo_update_workspace_command();
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect::<Vec<_>>();
 
-        assert!(
-            update_lockfile_package(
-                lockfile,
-                "demo",
-                &Version::parse("1.2.3").unwrap(),
-                &Version::parse("1.2.4").unwrap(),
-            )
-            .is_err()
-        );
+        assert_eq!(command.get_program(), OsStr::new("cargo"));
+        assert_eq!(args, ["update", "--workspace", "--manifest-path", MANIFEST]);
     }
 
     #[test]
