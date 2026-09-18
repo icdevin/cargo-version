@@ -95,6 +95,8 @@ fn run() -> Result<(), String> {
 
     if should_commit_and_tag {
         ensure_git_clean()?;
+        // Detect tag conflicts before changing files or creating a release commit.
+        ensure_git_tag_available(&update.new_version)?;
     }
 
     fs::write(manifest_path, update.content)
@@ -379,6 +381,25 @@ fn ensure_git_clean() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+// Check the exact tag ref so branches and similarly named tags do not block releases.
+fn ensure_git_tag_available(version: &Version) -> Result<(), String> {
+    let tag = format!("v{version}");
+    let reference = format!("refs/tags/{tag}");
+    let output = Command::new("git")
+        .args(["show-ref", "--verify", "--quiet", &reference])
+        .output()
+        .map_err(|error| format!("failed to check git tag '{tag}': {error}"))?;
+
+    match output.status.code() {
+        Some(0) => Err(format!(
+            "git tag '{tag}' already exists; cannot set package.version to {version}. Reconcile the Cargo version and git tags before retrying; no files or commits were changed"
+        )),
+        Some(1) => Ok(()),
+        // Git failures must not be treated as an available tag.
+        _ => Err(command_error("git show-ref", &output)),
+    }
 }
 
 fn commit_and_tag(

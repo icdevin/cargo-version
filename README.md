@@ -40,6 +40,11 @@ Inside a Git worktree, it also commits the changed Cargo files with message `X.Y
 and creates an unsigned tag named `vX.Y.Z`. Tracked files must be clean before the
 command runs; untracked files do not block it. It does not push or publish releases.
 
+If the target tag already exists locally, the command reports an error and exits
+before changing Cargo files or creating a commit. Fetch remote tags before running
+if needed. Use `--no-git-tag-version` to update only the Cargo files when reconciling
+a version with an existing tag.
+
 Use the executable name `cargo-version`, not `cargo version`, which is Cargo's
 built-in version command.
 
